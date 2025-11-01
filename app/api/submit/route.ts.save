@@ -1,0 +1,171 @@
+  const s = (ex?.status || ex?.state || '').toString().toLowerCase();
+  if (s && !['queued','pending','running','in_progress'].includes(s)) return true;
+  if (ex?.result) return true;
+  // Some runtimes stick output directly at top-level:
+  if (ex?.players || ex?.lineups || ex?.consensus || ex?.output) return true;
+  return false;
+}
+
+// Wait up to 10 minutes, poll every 2s
+async function waitExec(id: string, label: string, timeoutMs = 600000, pollMs = 2000) {
+  const start = Date.now();
+  while (true) {
+    try {
+      const ex = await getExec(id);
+      if (isDone(ex)) return ex;
+    } catch (e:any) {
+      if (!e?.__retry) throw new Error(`${label} poll failed: ${e?.message || String(e)}`);
+    }
+    if (Date.now() - start > timeoutMs) throw new Error(`${label} timed out after ${timeoutMs}ms`);
+    await new Promise(r => setTimeout(r, pollMs));
+  }
+}
+
+// ---- Local CSV fallback (fast, capped) ----
+function localCsvToPlayers(csvText: string, minSalary = 3500, maxPlayers = 120) {
+  const lines = csvText.split(/\r?\n/).filter(l => l.trim());
+  if (lines.length < 2) return [];
+  const hdr = lines[0].split(',').map(h => h.trim().toLowerCase());
+  const map = (name: string) => hdr.indexOf(name);
+
+  const idxName = map('name');
+  const idxPos1 = map('position');
+  const idxPos2 = map('positions');
+  const idxSal  = map('salary');
+  const idxTeam = ['teamabbrev','team','team_abbrev','teamabbr'].map(map).find(i => i >= 0) ?? -1;
+
+  if (idxName < 0 || idxSal < 0) return [];
+
+  const out: any[] = [];
+  for (let i=1;i<lines.length;i++) {
+    const cells = lines[i].split(',');
+    const name = (cells[idxName] || '').trim();
+    if (!name) continue;
+    const posRaw = idxPos1 >= 0 ? cells[idxPos1] : (idxPos2 >= 0 ? cells[idxPos2] : '');
+    const pos = (posRaw || '').replace('/', ',').split(',').map(p => p.trim().toUpperCase()).filter(Boolean);
+    const sal = parseFloat((cells[idxSal] || '').replace('$','')) || 0;
+    const team = idxTeam >= 0 ? (cells[idxTeam] || '').trim().toUpperCase() : '';
+    if (sal < minSalary) continue;
+    out.push({
+      name, player_id: name, positions: pos.length ? pos : ['UTIL'], salary: sal, team
+    });
+  }
+  out.sort((a,b) => (b.salary - a.salary) || a.name.localeCompare(b.name));
+  return out.slice(0, Math.max(0, maxPlayers));
+}
+
+// ---- Handler ----
+export async function POST(req: Request) {
+  try {
+    const form = await req.formData();
+    const file = form.get('file') as File | null;
+    if (!file) return jerr('Missing file', {}, 400);
+
+    const sport = (form.get('sport') as string) || 'NBA';
+    const site  = (form.get('site') as string)  || 'DK';
+
+    const buf = Buffer.from(await file.arrayBuffer());
+    const csv_text = buf.toString('utf8');
+    if (!csv_text.trim()) return jerr('Uploaded CSV empty', {}, 400);
+
+    const date = new Date().toISOString().slice(0,10);
+
+    const basePayload = {
+      slate: { sport, site, date, csv_text },
+      options: {
+        n_lineups: 20,
+        salary_cap: 50000,
+        min_players: 8,
+        include_injuries: true,
+        format: 'classic',
+        version: 'v1',
+        min_salary: 3500,
+        max_players: 120,
+        keep_starters: true
+      }
+    };
+
+    // 1) INGEST: Swarm first
+    let ingestedPlayers: any[] | null = null;
+    let ingestExecId: string | null = null;
+    try {
+      const jIngest = await createJob(AGENTS.INGEST, basePayload, 'INGEST');
+      ingestExecId = jIngest.execution_address;
+      const eIngest = await waitExec(ingestExecId, 'INGEST');
+
+      const raw = eIngest?.result || eIngest || {};
+      ingestedPlayers =
+        raw?.players || raw?.output?.players || raw?.data?.players || null;
+
+      if (!Array.isArray(ingestedPlayers) || ingestedPlayers.length === 0) {
+        // try to propagate ingest-side error if present
+        const ingestError = raw?.error || raw?.message || raw?.detail || null;
+        if (ingestError) throw new Error(`Ingest error: ${ingestError}`);
+        // else fall through to local fallback below
+        ingestedPlayers = null;
+      }
+    } catch (e:any) {
+      console.warn('[submit] INGEST via Swarm failed, will try local fallback:', e?.message || e);
+      ingestedPlayers = null;
+    }
+
+    // Local fallback if needed
+    if (!ingestedPlayers) {
+      const local = localCsvToPlayers(csv_text, 3500, 120);
+      if (local.length === 0) return jerr('Ingest failed and local CSV parse found 0 players', {}, 400);
+      ingestedPlayers = local;
+    }
+
+    // 2) SIGNALS (optional)
+    let signals: any = {};
+    if (AGENTS.SIGNALS) {
+      const jSig = await createJob(AGENTS.SIGNALS, { ...basePayload, players: ingestedPlayers }, 'SIGNALS');
+      const eSig = await waitExec(jSig.execution_address, 'SIGNALS');
+      signals = eSig?.result || eSig || {};
+    }
+
+    // 3) PROJECTIONS x2
+    const llms = [
+      { provider: 'anthropic', model: 'claude-3-5-sonnet', temperature: 0.2 },
+      { provider: 'openai',    model: 'gpt-4o-mini',       temperature: 0.2 }
+    ];
+    const projPayload = (llm:any)=>({
+      ...basePayload,
+      players: ingestedPlayers,
+      ...signals,
+      options: { ...basePayload.options, llm },
+    });
+
+    const pJobs = await Promise.all(llms.map(llm => createJob(AGENTS.PROJECTIONS, projPayload(llm), 'PROJECTIONS')));
+    const pExecs = await Promise.all(pJobs.map(j => waitExec(j.execution_address, 'PROJECTIONS')));
+    const projection_sets = pExecs.map(ex => {
+      const data = ex?.result?.output || ex?.result || ex?.data || ex;
+      return data?.players ? { players: data.players } : data;
+    });
+
+    // 4) CONSENSUS
+    const jCons = await createJob(AGENTS.CONSENSUS, { slate: basePayload.slate, method: 'avg', projection_sets }, 'CONSENSUS');
+    const eCons = await waitExec(jCons.execution_address, 'CONSENSUS');
+    const consensus = eCons?.result?.consensus || eCons?.result || eCons;
+
+    // 5) OPTIMIZER
+    const jOpt = await createJob(AGENTS.OPTIMIZER, { ...basePayload, consensus }, 'OPTIMIZER');
+    const eOpt = await waitExec(jOpt.execution_address, 'OPTIMIZER');
+    const lineups = eOpt?.result?.lineups || eOpt?.lineups || null;
+
+    return NextResponse.json({
+      ok: true,
+      lineups,
+      debug: {
+        ingest_exec: ingestExecId,
+        proj_execs: pJobs.map(j => j.execution_address),
+        cons_exec: jCons?.execution_address,
+        opt_exec: jOpt?.execution_address,
+        signals_used: !!AGENTS.SIGNALS
+      }
+    });
+  } catch (e:any) {
+    return jerr(e?.message || String(e));
+  }
+}
+

@@ -1,131 +1,284 @@
 import { NextResponse } from 'next/server';
 
 export const runtime = 'nodejs';
+export const maxDuration = 300; // up to ~5 minutes for the edge; we also poll up to 10 mins total
 
-// --- HARD-CODED (rotate before pushing public) ---
-const SWARMNODE_BASE = 'https://api.swarmnode.ai';
-const SWARMNODE_API_KEY = 'cba7a043f91c4613b967e77ca0dd123c';
+// ---- ENV / IDs ----
+const BASE = (process.env.SWARMNODE_BASE || 'https://api.swarmnode.ai').trim();
+const KEY  = (process.env.SWARMNODE_API_KEY || '').trim();
 
-const AGENT_IDS = {
-  INGEST:     'a2a2fc57-1b93-41a1-a1dd-0035e5289280',
-  SIGNALS:    'ca72bbfe-37c3-47b3-ada7-6e39f474eed4',
-  PROJECTIONS:'e8712c1e-5636-434c-9793-5ee85123025a',
-  CONSENSUS:  'c1b8ab28-5d1c-4609-b815-03dcb322e186',
-  OPTIMIZER:  'd154cbc3-ff61-4c87-b61c-2a75bce90146',
+const AGENTS = {
+  INGEST:      (process.env.AGENT_CSV_INGEST    || '').trim(),
+  PROJECTIONS: (process.env.AGENT_PROJECTIONS   || '').trim(),
+  CONSENSUS:   (process.env.AGENT_CONSENSUS     || '').trim(),
+  OPTIMIZER:   (process.env.AGENT_OPTIMIZER     || '').trim(),
+  SIGNALS:     (process.env.AGENT_SIGNALS       || '').trim(), // optional
 };
 
-// ---------- helpers ----------
-async function createJob(agent_id: string, payload: any) {
-  const res = await fetch(`${SWARMNODE_BASE}/v1/agent-executor-jobs/create/`, {
-    method: 'POST',
-    headers: { authorization: `Bearer ${SWARMNODE_API_KEY}`, 'content-type': 'application/json', accept:'application/json' },
-    body: JSON.stringify({ agent_id, payload }),
-    cache: 'no-store',
-  });
-  const txt = await res.text();
-  if (!res.ok) throw new Error(`Create job failed (${res.status}) for ${agent_id}: ${txt || 'no body'}`);
-  try { return JSON.parse(txt); } catch { throw new Error(`Create job bad JSON: ${txt}`); }
+// ---- Small helpers ----
+function jerr(msg: string, extra: any = {}, status = 500) {
+  console.error('[submit:error]', msg, extra);
+  return NextResponse.json({ ok: false, error: msg, extra }, { status });
 }
 
-async function getExec(id: string) {
-  for (const url of [
-    `${SWARMNODE_BASE}/v1/executions/${id}/`,
-    `${SWARMNODE_BASE}/v1/executions/${id}`,
-  ]) {
-    const res = await fetch(url, { headers: { authorization: `Bearer ${SWARMNODE_API_KEY}` }, cache: 'no-store' });
-    const txt = await res.text();
-    if (res.ok) { try { return JSON.parse(txt); } catch { throw new Error(`Bad JSON from ${url}: ${txt}`); } }
-    if (res.status !== 404) throw new Error(`Execution ${id} failed (${res.status}): ${txt || 'no body'}`);
+function assertEnv() {
+  if (!KEY) throw new Error('Missing SWARMNODE_API_KEY');
+  if (!AGENTS.INGEST || !AGENTS.PROJECTIONS || !AGENTS.CONSENSUS || !AGENTS.OPTIMIZER) {
+    throw new Error('Missing one or more required agent IDs (INGEST/PROJECTIONS/CONSENSUS/OPTIMIZER)');
   }
-  const e: any = new Error('not-ready'); e.__retry = true; throw e;
 }
 
-async function waitExec(id: string, timeoutMs = 120000, pollMs = 1500) {
-  const start = Date.now();
+// Try both endpoints (some tenants use /create/, some accept root POST)
+async function createJob(agent_id: string, payload: any, label: string) {
+  const endpoints = [
+    `${BASE}/v1/agent-executor-jobs/create/`,
+    `${BASE}/v1/agent-executor-jobs/`,
+  ];
+
+  const errors: Array<{ url: string; status?: number; text?: string }> = [];
+  for (const url of endpoints) {
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${KEY}`,      // CRITICAL: exact header + trimmed key
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({ agent_id, payload }),
+        cache: 'no-store',
+      });
+      const txt = await res.text();
+      if (!res.ok) {
+        errors.push({ url, status: res.status, text: txt });
+        continue;
+      }
+      const parsed = JSON.parse(txt || '{}');
+      if (parsed?.execution_address) return parsed;
+      errors.push({ url, status: res.status, text: 'No execution_address in response' });
+    } catch (e: any) {
+      errors.push({ url, text: e?.message || String(e) });
+    }
+  }
+  throw new Error(`Create job failed for ${label}/${agent_id}: ${JSON.stringify(errors)}`);
+}
+
+async function getExec(executionId: string) {
+  const urls = [
+    `${BASE}/v1/executions/${executionId}/`,
+    `${BASE}/v1/executions/${executionId}`,
+  ];
+  for (const url of urls) {
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${KEY}` },
+      cache: 'no-store',
+    });
+    const txt = await res.text();
+    if (res.ok) return JSON.parse(txt || '{}');
+    // 404 means not ready yet — keep polling; other codes bubble up
+    if (res.status !== 404) throw new Error(`Get execution failed (${res.status}): ${txt || 'no body'}`);
+  }
+  const err: any = new Error('not-ready');
+  err.__retry = true;
+  throw err;
+}
+
+// Treat as done if status is terminal OR there is a result/known payload present
+function isDone(ex: any) {
+  const s = (ex?.status || ex?.state || '').toString().toLowerCase();
+  if (s && !['queued', 'pending', 'running', 'in_progress'].includes(s)) return true;
+  if (ex?.result) return true;
+  if (ex?.players || ex?.lineups || ex?.consensus || ex?.output) return true;
+  return false;
+}
+
+// Poll up to 10 minutes
+async function waitExec(executionId: string, label: string, timeoutMs = 600_000, pollMs = 2_000) {
+  const t0 = Date.now();
   while (true) {
     try {
-      const ex = await getExec(id);
-      const s = (ex.status || ex.state || '').toLowerCase();
-      if (s && !['queued','pending','running','in_progress'].includes(s)) return ex;
-    } catch (e:any) { if (!e?.__retry) throw e; }
-    if (Date.now() - start > timeoutMs) return { timeout:true, id };
+      const ex = await getExec(executionId);
+      if (isDone(ex)) return ex;
+    } catch (e: any) {
+      if (!e?.__retry) throw new Error(`${label} poll failed: ${e?.message || String(e)}`);
+    }
+    if (Date.now() - t0 > timeoutMs) throw new Error(`${label} timed out after ${timeoutMs}ms`);
     await new Promise(r => setTimeout(r, pollMs));
   }
 }
 
-// ---------- POST ----------
+// ---- Local CSV fallback (fast, capped) ----
+function localCsvToPlayers(csvText: string, minSalary = 3500, maxPlayers = 120) {
+  const lines = csvText.split(/\r?\n/).filter(l => l.trim());
+  if (lines.length < 2) return [];
+  const hdr = lines[0].split(',').map(h => h.trim().toLowerCase());
+  const idx = (key: string) => hdr.indexOf(key);
+
+  const iName = idx('name');
+  const iPos1 = idx('position');
+  const iPos2 = idx('positions');
+  const iSal  = idx('salary');
+  const iTeam = ['teamabbrev', 'team', 'team_abbrev', 'teamabbr']
+    .map(idx)
+    .find(i => i >= 0) ?? -1;
+
+  if (iName < 0 || iSal < 0) return [];
+
+  const out: any[] = [];
+  for (let r = 1; r < lines.length; r++) {
+    const cells = lines[r].split(',');
+    const name = (cells[iName] || '').trim();
+    if (!name) continue;
+    const posRaw = iPos1 >= 0 ? cells[iPos1] : (iPos2 >= 0 ? cells[iPos2] : '');
+    const positions = (posRaw || '')
+      .replace('/', ',')
+      .split(',')
+      .map(p => p.trim().toUpperCase())
+      .filter(Boolean);
+    const salary = parseFloat((cells[iSal] || '').replace('$', '')) || 0;
+    const team = iTeam >= 0 ? (cells[iTeam] || '').trim().toUpperCase() : '';
+    if (salary < minSalary) continue;
+    out.push({
+      name,
+      player_id: name,
+      positions: positions.length ? positions : ['UTIL'],
+      salary,
+      team,
+    });
+  }
+  out.sort((a, b) => (b.salary - a.salary) || a.name.localeCompare(b.name));
+  return out.slice(0, Math.max(0, maxPlayers));
+}
+
+// ---- Route handler ----
 export async function POST(req: Request) {
   try {
+    assertEnv();
+
     const form = await req.formData();
     const file = form.get('file') as File | null;
+    if (!file) return jerr('Missing file', {}, 400);
+
     const sport = (form.get('sport') as string) || 'NBA';
-    const site  = (form.get('site') as string)  || 'DK';
-    if (!file) return NextResponse.json({ ok:false, error:'Missing file' }, { status: 400 });
+    const site  = (form.get('site')  as string) || 'DK';
 
     const buf = Buffer.from(await file.arrayBuffer());
     const csv_text = buf.toString('utf8');
-    const date = new Date().toISOString().slice(0,10);
+    if (!csv_text.trim()) return jerr('Uploaded CSV empty', {}, 400);
 
+    const date = new Date().toISOString().slice(0, 10);
+
+    // shared options (you can tweak caps here)
     const basePayload = {
       slate: { sport, site, date, csv_text },
-      options: { n_lineups: 20, salary_cap: 50000, min_players: 8, include_injuries: true, format: 'classic', version: 'v1' }
+      options: {
+        n_lineups: 20,
+        salary_cap: 50000,
+        min_players: 8,
+        include_injuries: true,
+        format: 'classic',
+        version: 'v1',
+        // Ingest caps:
+        min_salary: 3500,
+        max_players: 120,
+        keep_starters: true,
+      },
     };
 
-    // 1) INGEST
-    const jIngest = await createJob(AGENT_IDS.INGEST, basePayload);
-    const eIngest = await waitExec(jIngest.execution_address);
-    const ingestedPlayers =
-      eIngest?.result?.players ||
-      eIngest?.result?.output?.players ||
-      eIngest?.players || null;
+    // 1) INGEST (Swarm) with local fallback
+    let ingestedPlayers: any[] | null = null;
+    let ingestExecId: string | null = null;
 
-    // 2) SIGNALS (pass ingested players)
-    const jSig = await createJob(AGENT_IDS.SIGNALS, { ...basePayload, players: ingestedPlayers || [] });
-    const eSig = await waitExec(jSig.execution_address);
-    const signals = eSig?.result || eSig || {};
+    try {
+      const jIngest = await createJob(AGENTS.INGEST, basePayload, 'INGEST');
+      ingestExecId = jIngest.execution_address;
+      const eIngest = await waitExec(ingestExecId, 'INGEST');
+      const raw = eIngest?.result || eIngest || {};
+      ingestedPlayers =
+        raw?.players || raw?.output?.players || raw?.data?.players || null;
 
-    // 3) PROJECTIONS x2 (Claude + ChatGPT) with signals injected
+      if (!Array.isArray(ingestedPlayers) || ingestedPlayers.length === 0) {
+        const errMsg = raw?.error || raw?.message || raw?.detail || null;
+        if (errMsg) throw new Error(`Ingest error: ${errMsg}`);
+        ingestedPlayers = null; // fall back below
+      }
+    } catch (e: any) {
+      console.warn('[submit] INGEST via Swarm failed, will try local CSV fallback:', e?.message || String(e));
+      ingestedPlayers = null;
+    }
+
+    if (!ingestedPlayers) {
+      const local = localCsvToPlayers(csv_text, 3500, 120);
+      if (local.length === 0) return jerr('Ingest failed and local CSV parse found 0 players', {}, 400);
+      ingestedPlayers = local;
+    }
+
+    // 2) SIGNALS (optional but recommended)
+    let signals: any = {};
+    if (AGENTS.SIGNALS) {
+      const jSig = await createJob(
+        AGENTS.SIGNALS,
+        { ...basePayload, players: ingestedPlayers },
+        'SIGNALS'
+      );
+      const eSig = await waitExec(jSig.execution_address, 'SIGNALS');
+      signals = eSig?.result || eSig || {};
+    }
+
+    // 3) PROJECTIONS (run twice: Claude + GPT)
     const llms = [
       { provider: 'anthropic', model: 'claude-3-5-sonnet', temperature: 0.2 },
       { provider: 'openai',    model: 'gpt-4o-mini',       temperature: 0.2 },
     ];
-    const projPayload = (llm:any)=>({
+    const projPayload = (llm: any) => ({
       ...basePayload,
-      ...(ingestedPlayers ? { players: ingestedPlayers } : {}),
-      ...signals,
+      players: ingestedPlayers,
+      ...signals, // inject signals bundle
       options: { ...basePayload.options, llm },
     });
 
-    const projJobs = await Promise.all(llms.map(llm => createJob(AGENT_IDS.PROJECTIONS, projPayload(llm))));
-    const projExecs = await Promise.all(projJobs.map(j => waitExec(j.execution_address)));
-    const projection_sets = projExecs.map(ex => {
+    const pJobs = await Promise.all(
+      llms.map((llm) => createJob(AGENTS.PROJECTIONS, projPayload(llm), 'PROJECTIONS'))
+    );
+    const pExecs = await Promise.all(
+      pJobs.map((j) => waitExec(j.execution_address, 'PROJECTIONS'))
+    );
+    const projection_sets = pExecs.map((ex) => {
       const data = ex?.result?.output || ex?.result || ex?.data || ex;
       return data?.players ? { players: data.players } : data;
     });
 
     // 4) CONSENSUS
-    const jCons = await createJob(AGENT_IDS.CONSENSUS, { slate: basePayload.slate, method: 'avg', projection_sets });
-    const eCons = await waitExec(jCons.execution_address);
+    const jCons = await createJob(
+      AGENTS.CONSENSUS,
+      { slate: basePayload.slate, method: 'avg', projection_sets },
+      'CONSENSUS'
+    );
+    const eCons = await waitExec(jCons.execution_address, 'CONSENSUS');
     const consensus = eCons?.result?.consensus || eCons?.result || eCons;
 
     // 5) OPTIMIZER
-    const jOpt = await createJob(AGENT_IDS.OPTIMIZER, { ...basePayload, consensus });
-    const eOpt = await waitExec(jOpt.execution_address);
+    const jOpt = await createJob(
+      AGENTS.OPTIMIZER,
+      { ...basePayload, consensus },
+      'OPTIMIZER'
+    );
+    const eOpt = await waitExec(jOpt.execution_address, 'OPTIMIZER');
     const lineups = eOpt?.result?.lineups || eOpt?.lineups || null;
 
     return NextResponse.json({
       ok: true,
       lineups,
       debug: {
-        ingest_exec: jIngest?.execution_address,
-        signals_exec: jSig?.execution_address,
-        proj_execs: projJobs.map(j => j.execution_address),
+        ingest_exec: ingestExecId,
+        proj_execs: pJobs.map((j) => j.execution_address),
         cons_exec: jCons?.execution_address,
         opt_exec: jOpt?.execution_address,
-      }
+        signals_used: !!AGENTS.SIGNALS,
+      },
     });
-  } catch (e:any) {
-    return NextResponse.json({ ok:false, error: e?.message || String(e) }, { status: 500 });
+  } catch (e: any) {
+    return jerr(e?.message || String(e));
   }
 }
 
