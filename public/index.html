@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DFS Lineup Optimizer</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            padding: 40px;
+            max-width: 600px;
+            width: 100%;
+        }
+        h1 { color: #333; margin-bottom: 10px; }
+        .upload-area {
+            border: 3px dashed #667eea;
+            border-radius: 15px;
+            padding: 40px;
+            text-align: center;
+            cursor: pointer;
+            margin: 20px 0;
+            transition: all 0.3s;
+        }
+        .upload-area:hover { background: #f8f9ff; }
+        input[type="file"] { display: none; }
+        button {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 15px 40px;
+            border-radius: 10px;
+            font-size: 16px;
+            cursor: pointer;
+            width: 100%;
+        }
+        button:disabled { background: #ccc; }
+        .result {
+            margin-top: 20px;
+            padding: 20px;
+            border-radius: 10px;
+            display: none;
+        }
+        .result.success { background: #d4edda; color: #155724; }
+        .result.error { background: #f8d7da; color: #721c24; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🏀 DFS Lineup Optimizer</h1>
+        <p style="color: #666; margin-bottom: 20px;">AI-Powered NBA Cash Game Optimizer</p>
+        
+        <div class="upload-area" id="uploadArea">
+            <div style="font-size: 48px; margin-bottom: 15px;">📊</div>
+            <h3>Upload DraftKings CSV</h3>
+            <p style="color: #666; margin-top: 10px;">Click or drag & drop</p>
+            <input type="file" id="fileInput" accept=".csv">
+        </div>
+        
+        <div id="filename" style="display: none; padding: 10px; background: #f8f9ff; border-radius: 5px; margin-bottom: 10px;"></div>
+        
+        <button id="uploadBtn" disabled>Optimize Lineup</button>
+        
+        <div class="result" id="result"></div>
+    </div>
+
+    <script>
+        const uploadArea = document.getElementById('uploadArea');
+        const fileInput = document.getElementById('fileInput');
+        const uploadBtn = document.getElementById('uploadBtn');
+        const result = document.getElementById('result');
+        const filename = document.getElementById('filename');
+        let selectedFile = null;
+
+        uploadArea.onclick = () => fileInput.click();
+        
+        uploadArea.ondragover = (e) => { e.preventDefault(); uploadArea.style.background = '#f0f2ff'; };
+        uploadArea.ondragleave = () => { uploadArea.style.background = ''; };
+        uploadArea.ondrop = (e) => {
+            e.preventDefault();
+            uploadArea.style.background = '';
+            if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+        };
+
+        fileInput.onchange = (e) => {
+            if (e.target.files.length) handleFile(e.target.files[0]);
+        };
+
+        function handleFile(file) {
+            if (!file.name.endsWith('.csv')) {
+                showResult('error', '❌ Please upload a CSV file');
+                return;
+            }
+            selectedFile = file;
+            filename.style.display = 'block';
+            filename.textContent = `📄 ${file.name} (${(file.size / 1024).toFixed(1)} KB)`;
+            uploadBtn.disabled = false;
+        }
+
+        uploadBtn.onclick = async () => {
+            if (!selectedFile) return;
+            uploadBtn.disabled = true;
+            uploadBtn.textContent = 'Processing...';
+            
+            try {
+                const csvText = await selectedFile.text();
+                const response = await fetch('/api/upload', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ csv: csvText })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok && data.success) {
+                    showResult('success', `✅ ${data.message}<br><br><strong>Job ID:</strong> ${data.job_id}<br><br>${data.next_steps.join('<br>')}`);
+                } else {
+                    showResult('error', `❌ Error: ${data.error}<br><br>${data.details || ''}`);
+                }
+            } catch (error) {
+                showResult('error', `❌ Network error: ${error.message}`);
+            } finally {
+                uploadBtn.disabled = false;
+                uploadBtn.textContent = 'Optimize Lineup';
+            }
+        };
+
+        function showResult(type, message) {
+            result.className = `result ${type}`;
+            result.innerHTML = message;
+            result.style.display = 'block';
+        }
+    </script>
+</body>
+</html>
