@@ -1,9 +1,8 @@
-cat > .gitignore << 'EOF'
+.next/
 node_modules/
 .vercel
 .env
 .env.local
 *.log
 .DS_Store
-.next/
-EOF
+package-lock.json

@@ -1,11 +1,5 @@
-cat > package.json << 'EOF'
 {
   "name": "dk-uploader",
   "version": "1.0.0",
-  "description": "DraftKings DFS Lineup Optimizer with AI",
-  "scripts": {},
-  "keywords": ["dfs", "draftkings", "nba", "optimizer", "ai"],
-  "author": "",
-  "license": "MIT"
+  "description": "DraftKings DFS Lineup Optimizer"
 }
-EOF
